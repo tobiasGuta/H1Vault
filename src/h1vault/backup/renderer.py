@@ -86,8 +86,9 @@ def render_original(report: dict[str, Any]) -> str:
     body = str(attrs.get("vulnerability_information") or "")
     impact = attrs.get("impact")
     if impact:
-        return f"{body.rstrip()}\n\n## Impact\n\n{impact}\n"
-    return f"{body.rstrip()}\n" if body else ""
+        separator = "\n" if body.endswith("\n") else "\n\n"
+        return f"{body}{separator}## Impact\n\n{impact}"
+    return body
 
 
 def render_report(
@@ -99,6 +100,9 @@ def render_report(
     handle = program_handle(report) or "Unknown"
     lines = [
         f"# {title}",
+        "",
+        "> This is a sanitized human-readable presentation. Use `report.raw.json` and "
+        "`original-report.md` for evidence-preserving content.",
         "",
         "## Metadata",
         "",

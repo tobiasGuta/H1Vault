@@ -40,7 +40,15 @@ H1Vault itself has no telemetry, analytics, update checker, upload path, or thir
 processor.
 
 Temporary attachment capabilities (`expiring_url`) are redacted before JSON or Markdown is written.
-Before sharing a ZIP, run `h1vault verify`, inspect the archive, and use a reputable secret scanner.
+Researcher-authored PoC tokens, Authorization examples, and signed-example parameters remain exact in
+`report.raw.json` and `original-report.md`; those evidence files are intentionally not safe-to-share.
+Use the sanitized views for review, but still scan them before publication. Before sharing a ZIP, run
+`h1vault verify`, inspect the archive, and use a reputable secret scanner.
 Share only with recipients authorized to access every included report. A successful H1Vault check
 does not replace organizational disclosure rules or a full secret scan.
 
+H1Vault sets `trust_env=False` for authenticated API and attachment clients. Ambient Burp/system proxy
+and custom CA environment variables are therefore ignored. Attachment connections validate DNS
+answers and pin the actual TCP connection to one of those validated public addresses while TLS still
+verifies the original hostname. ZIP creation uses only manifest-listed regular files, rejects links
+and Windows reparse points, and does not recursively archive arbitrary backup contents.

@@ -37,6 +37,27 @@ def test_one_page_and_empty_final_page() -> None:
     assert pages == [1, 2]
 
 
+def test_full_page_with_empty_links_falls_back_to_numbered_pagination() -> None:
+    pages: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(parse_qs(request.url.query.decode())["page[number]"][0])
+        pages.append(page)
+        data = [resource(i) for i in range(100)] if page == 1 else [resource(100)]
+        return httpx.Response(200, json={"data": data, "links": {}})
+
+    with make_client(handler) as api:
+        assert len(list(api.iter_reports())) == 101
+    assert pages == [1, 2]
+
+
+def test_repeated_full_numbered_page_is_rejected() -> None:
+    data = [resource(i) for i in range(100)]
+    with make_client(lambda _: httpx.Response(200, json={"data": data})) as api:
+        with pytest.raises(InvalidAPIResponseError, match="repeated an entire report page"):
+            list(api.iter_reports())
+
+
 def test_multiple_incrementing_pages() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         page = int(parse_qs(request.url.query.decode())["page[number]"][0])

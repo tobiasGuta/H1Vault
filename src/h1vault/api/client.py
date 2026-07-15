@@ -63,6 +63,7 @@ class HackerOneClient:
             limits=httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency),
             follow_redirects=False,
             verify=True,
+            trust_env=False,
             transport=transport,
         )
 
@@ -127,6 +128,7 @@ class HackerOneClient:
         use_links = False
         seen_links: set[str] = set()
         seen_ids: set[str] = set()
+        seen_pages: set[tuple[str, ...]] = set()
         while next_url is not None:
             pagination_key = next_url if use_links else f"{next_url}#page={page}"
             if pagination_key in seen_links:
@@ -143,23 +145,30 @@ class HackerOneClient:
                     "Malformed report-list response: expected a data array."
                 ) from exc
             items = [item.model_dump(mode="json", exclude_none=False) for item in collection.data]
+            page_ids = tuple(item["id"] for item in items)
+            if page_ids and page_ids in seen_pages:
+                raise InvalidAPIResponseError(
+                    "Pagination repeated an entire report page; refusing an infinite loop."
+                )
+            seen_pages.add(page_ids)
             for item in items:
                 report_id = item["id"]
                 if report_id not in seen_ids:
                     seen_ids.add(report_id)
                     yield item
-            links_present = "links" in raw and isinstance(raw.get("links"), dict)
             next_link = collection.links.get("next")
             if next_link is not None:
                 if not isinstance(next_link, str) or not next_link:
                     raise InvalidAPIResponseError("Pagination supplied a malformed next link.")
                 next_url = next_link
                 use_links = True
-            elif links_present or not items or len(items) < page_size:
+                page += 1
+            elif not items or len(items) < page_size:
                 next_url = None
             else:
                 page += 1
                 next_url = "hackers/me/reports"
+                use_links = False
 
     def get_report(self, report_id: str) -> dict[str, Any]:
         raw = self.get_json(f"hackers/reports/{report_id}")

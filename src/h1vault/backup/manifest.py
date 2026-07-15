@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from h1vault.backup.io import write_json
+from h1vault.backup.io import file_sha256, write_json
 
 SCHEMA_VERSION = 1
 
@@ -177,33 +177,63 @@ def write_manifest(
     attachments: dict[str, list[dict[str, Any]]],
     failures: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    report_items = []
+    report_items: list[dict[str, Any]] = []
+    archive_files: dict[str, dict[str, Any]] = {}
     downloaded = skipped = 0
     for report in reports:
         report_id = str(report["report_id"])
         items = attachments.get(report_id, [])
+        report_path = str(report["report_directory"])
+        report_root = root / report_path
+        exported_files: dict[str, dict[str, Any]] = {}
+        for name in (
+            "report.raw.json",
+            "report.sanitized.json",
+            "report.md",
+            "original-report.md",
+            "timeline.json",
+            "metadata.json",
+        ):
+            path = report_root / name
+            if not path.is_file():
+                continue
+            record = {"sha256": file_sha256(path), "size": path.stat().st_size}
+            exported_files[name] = record
+            archive_files[f"{report_path}/{name}"] = record
         downloaded += sum(item.get("download_status") == "downloaded" for item in items)
         skipped += sum(item.get("download_status") == "skipped" for item in items)
+        attachment_records = []
+        for item in items:
+            attachment = {
+                "id": item["attachment_id"],
+                "path": item.get("local_path"),
+                "sha256": item.get("sha256"),
+                "size": item.get("expected_size"),
+                "status": item["download_status"],
+                "error": item.get("last_error"),
+            }
+            attachment_records.append(attachment)
+            if attachment["status"] == "downloaded" and attachment["path"] and attachment["sha256"]:
+                archive_files[str(attachment["path"])] = {
+                    "sha256": attachment["sha256"],
+                    "size": attachment["size"],
+                }
         report_items.append(
             {
                 "id": report_id,
-                "path": report["report_directory"],
+                "program_handle": program,
+                "path": report_path,
                 "detail_sha256": report["detail_fingerprint"],
-                "attachments": [
-                    {
-                        "id": item["attachment_id"],
-                        "path": item.get("local_path"),
-                        "sha256": item.get("sha256"),
-                        "size": item.get("expected_size"),
-                        "status": item["download_status"],
-                        "error": item.get("last_error"),
-                    }
-                    for item in items
-                ],
+                "files": exported_files,
+                "attachments": attachment_records,
             }
         )
+    for name in ("index.md", "index.json", "program.json"):
+        path = root / name
+        if path.is_file():
+            archive_files[name] = {"sha256": file_sha256(path), "size": path.stat().st_size}
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
         "h1vault_version": __import__("h1vault").__version__,
         "program_handle": program,
         "created_at": created_at,
@@ -212,6 +242,8 @@ def write_manifest(
         "report_count": len(reports),
         "report_ids": [item["id"] for item in report_items],
         "reports": report_items,
+        "archive_files": archive_files,
+        "snapshot_paths": ["manifest.json", *sorted(archive_files)],
         "failed_items": failures,
         "statistics": {
             "attachments_downloaded": downloaded,

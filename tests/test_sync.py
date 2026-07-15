@@ -76,7 +76,7 @@ def test_initial_then_unchanged_sync_avoids_detail_and_rewrites(
 ) -> None:
     client = FakeClient([report_factory()])
     first = Synchronizer(client, options(tmp_path)).run()
-    report_file = next((tmp_path / "example-program" / "reports").glob("*/report.json"))
+    report_file = next((tmp_path / "example-program" / "reports").glob("*/report.raw.json"))
     first_mtime = report_file.stat().st_mtime_ns
     second = Synchronizer(client, options(tmp_path)).run()
     assert (first.new_reports, second.unchanged_reports) == (1, 1)
@@ -114,6 +114,28 @@ def test_attachment_download_and_second_run_skip(tmp_path: Path, report_factory)
     assert first.attachments_downloaded == 1
     assert second.unchanged_reports == 1
     assert downloader.calls == 1
+
+
+def test_synchronizer_closes_only_downloader_it_creates(
+    tmp_path: Path, report_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instances: list[Any] = []
+
+    class OwnedDownloader(FakeDownloader):
+        def __init__(self, *, max_bytes: int) -> None:
+            super().__init__()
+            self.max_bytes = max_bytes
+            self.closed = False
+            instances.append(self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr("h1vault.backup.synchronizer.AttachmentDownloader", OwnedDownloader)
+    report = report_factory(relationships=attachment_relationship())
+    Synchronizer(FakeClient([report]), options(tmp_path)).run()
+    assert len(instances) == 1
+    assert instances[0].closed is True
 
 
 def test_failed_attachment_retried_next_sync(tmp_path: Path, report_factory) -> None:

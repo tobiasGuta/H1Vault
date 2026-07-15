@@ -142,3 +142,8 @@ def test_unknown_fields_are_preserved(report_factory) -> None:
 def test_tls_verification_cannot_be_disabled() -> None:
     with pytest.raises(TypeError):
         HackerOneClient(Credentials("u", "t", "test"), verify=False)  # type: ignore[call-arg]
+
+
+def test_authenticated_client_does_not_trust_proxy_environment() -> None:
+    with client(lambda _: httpx.Response(200, json={"data": []})) as api:
+        assert api._client._trust_env is False

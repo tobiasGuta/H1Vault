@@ -138,7 +138,8 @@ HackerOneBackups/
     └── reports/
         └── 123456-example-title/
             ├── report.md
-            ├── report.json
+            ├── report.raw.json
+            ├── report.sanitized.json
             ├── original-report.md
             ├── timeline.json
             ├── metadata.json
@@ -149,12 +150,25 @@ The report ID is the stable directory identity; the title suffix is cosmetic. Re
 made Windows-safe, length-limited, collision-resistant through attachment IDs, and contained beneath
 the expected attachment directory.
 
+`report.raw.json` preserves the accessible API report as evidence, replacing only API-generated
+temporary attachment capabilities. `original-report.md` preserves the researcher's vulnerability
+information and separate impact text without sanitizing PoC headers or signed-example parameters.
+These two files are confidential and are not safe-to-share views. `report.sanitized.json`,
+`timeline.json`, and the clearly labeled `report.md` apply defensive redaction for presentation.
+
+Backups created by H1Vault before manifest schema 2 must be synchronized once before `verify` or
+`snapshot`. The next sync detects the missing split exports, regenerates them, removes legacy
+`report.json`, and atomically writes the schema-2 manifest; the SQLite schema itself is unchanged.
+
 ## Verification
 
 `h1vault verify --program HANDLE --output PATH` returns nonzero for a malformed manifest, missing or
-invalid report files, changed attachments, stale partial files, unsafe paths, SQLite disagreement,
-temporary signed URLs, configured-token leakage, or unredacted Authorization headers. Verification
-does not execute attachments.
+invalid report files, modified report or attachment hashes/sizes, report identity or program
+disagreement, metadata/manifest disagreement, unexpected report directories, untracked files,
+links/reparse points, stale partial files, unsafe paths, SQLite disagreement, temporary capabilities,
+or secrets leaked into generated sanitized files. Evidence-preserving raw/original files may contain
+PoC credentials exactly as submitted and must be handled as confidential. Verification does not
+execute attachments.
 
 ## Portable ZIP snapshots
 
@@ -166,8 +180,11 @@ h1vault snapshot `
 ```
 
 H1Vault warns that the archive is confidential and verifies the backup first. It refuses on failure
-unless `--force` is supplied. ZIPs exclude `state.sqlite3`, logs, and temporary files, and include the
-human-readable manifest. Store and share them as sensitive security data.
+unless `--force` is supplied; unsafe links, reparse points, and untracked files are refused even with
+force. ZIPs use the manifest's explicit file allowlist rather than walking the directory. Every source
+is opened without following links, hashed on the same file descriptor, and streamed from that exact
+handle. ZIPs exclude `state.sqlite3`, logs, and temporary files and include the human-readable
+manifest. Store and share them as sensitive security data.
 
 ## Configuration
 
@@ -207,8 +224,10 @@ failures, timeouts, 429, 500, 502, 503, and 504. Backoff is exponential with jit
 - **403/404:** confirm the authenticated researcher can access that exact report.
 - **No matching program:** run `h1vault programs list` and use the displayed exact handle.
 - **Keyring unavailable:** install/configure a supported OS keyring, or use session environment values.
-- **TLS/network timeout:** check system time, trusted roots, firewall, VPN, and proxy policy. H1Vault
-  will not disable TLS verification.
+- **TLS/network timeout:** check system time, trusted roots, firewall, and VPN policy. H1Vault disables
+  HTTPX environment trust, so `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `SSL_CERT_FILE`, and similar
+  ambient proxy/certificate variables are not used. H1Vault has no implicit Burp/system-proxy mode
+  and will not disable TLS verification.
 - **429:** wait; H1Vault already honors the server delay and performs bounded automatic retries.
 - **Unwritable output:** choose a local path for which the current account has create/write access.
 - **Corrupt backup:** preserve it, run `verify --json`, then sync again to repair missing local files.
@@ -239,6 +258,10 @@ pytest
 Tests use HTTPX mock transports/Respx and never contact the real HackerOne API. Do not use a real
 token in tests.
 
+GitHub Actions runs formatting, linting, strict mypy, and coverage-enforced tests on Ubuntu and
+Windows with Python 3.12 and 3.13. Separate jobs run `pip-audit` and CodeQL. Workflow presence does
+not prove a run succeeded until the repository is pushed and GitHub reports a successful check.
+
 ## Exit codes
 
 - `0`: requested operation completed successfully
@@ -257,9 +280,13 @@ or determine the safety of attachments. It does not upload, cloud-sync, or provi
 
 Report contents remain under the chosen local output root. Authentication goes only to
 `https://api.hackerone.com/v1`; attachment requests go only to HTTPS capabilities returned by an
-accessible report and use a separate client with no HackerOne Authorization header. Temporary URLs,
-cookies, Authorization fields, and token-like unexpected fields are redacted before export. Logs do
-not contain full response bodies by default. Review filesystem permissions and all archive recipients.
+accessible report and use a separate client with no HackerOne Authorization header. Both clients
+ignore ambient proxy and custom-certificate environment variables. Attachment DNS answers are
+validated and the transport connects to the same pinned public IP while retaining hostname TLS
+verification, closing the DNS-rebinding gap. Temporary attachment capabilities are removed from all
+exports. Sanitized exports redact cookies, Authorization fields, and token-like values; raw/original
+evidence intentionally preserves researcher-authored text. Logs do not contain full response bodies
+by default. Review filesystem permissions and all archive recipients.
 
 H1Vault uses the [official Hacker API documentation](https://api.hackerone.com/hacker-resources/) as
 its protocol source. HackerOne may add fields without a version bump, so local models allow unknown

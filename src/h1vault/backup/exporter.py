@@ -11,7 +11,7 @@ from h1vault import __version__
 from h1vault.backup.io import atomic_write, fingerprint, write_json
 from h1vault.backup.renderer import extract_activities, render_original, render_report
 from h1vault.security.filenames import report_directory_name, safe_filename
-from h1vault.security.redaction import redact_data
+from h1vault.security.redaction import redact_data, redact_temporary_capabilities
 
 
 @dataclass(frozen=True)
@@ -51,18 +51,27 @@ def export_report(
     attachment_records: list[dict[str, Any]],
     warnings: list[str] | None = None,
 ) -> ExportResult:
-    """Write all report representations after recursively removing capabilities/secrets."""
+    """Write evidence-preserving raw/original and clearly sanitized representations."""
     report_id = str(report["id"])
     raw_attributes = report.get("attributes")
     attributes: dict[str, Any] = raw_attributes if isinstance(raw_attributes, dict) else {}
     title = str(attributes.get("title") or "untitled")
     directory = choose_report_directory(reports_root, report_id, title)
     directory.mkdir(parents=True, exist_ok=True)
+    raw_report = redact_temporary_capabilities(report)
     safe_report = redact_data(report)
     timeline = redact_data(extract_activities(report))
-    report_hash = fingerprint(safe_report)
-    paths = ("report.md", "report.json", "original-report.md", "timeline.json", "metadata.json")
-    write_json(directory / "report.json", {"data": safe_report})
+    report_hash = fingerprint(raw_report)
+    paths = (
+        "report.raw.json",
+        "report.sanitized.json",
+        "report.md",
+        "original-report.md",
+        "timeline.json",
+        "metadata.json",
+    )
+    write_json(directory / "report.raw.json", {"data": raw_report})
+    write_json(directory / "report.sanitized.json", {"data": safe_report})
     write_json(directory / "timeline.json", {"schema_version": 1, "activities": timeline})
     atomic_write(
         directory / "report.md",
@@ -70,9 +79,9 @@ def export_report(
             safe_report, synchronized_at=synchronized_at, attachment_records=attachment_records
         ).encode("utf-8"),
     )
-    atomic_write(directory / "original-report.md", render_original(safe_report).encode("utf-8"))
+    atomic_write(directory / "original-report.md", render_original(report).encode("utf-8"))
     metadata = {
-        "schema_version": 1,
+        "schema_version": 2,
         "h1vault_version": __version__,
         "source_api_version": "v1",
         "report_id": report_id,
@@ -89,6 +98,7 @@ def export_report(
         "warnings": warnings or [],
     }
     write_json(directory / "metadata.json", metadata)
+    (directory / "report.json").unlink(missing_ok=True)
     return ExportResult(directory, report_hash, paths)
 
 

@@ -82,9 +82,18 @@ class Synchronizer:
         self.program_root = options.output / safe_filename(options.program, fallback="program")
         self.reports_root = self.program_root / "reports"
         self.downloader = downloader
+        self._owns_downloader = False
         self.progress = progress
 
     def run(self) -> SyncSummary:
+        """Run one synchronization and close only downloader resources owned here."""
+        try:
+            return self._run()
+        finally:
+            if self._owns_downloader and self.downloader is not None:
+                self.downloader.close()
+
+    def _run(self) -> SyncSummary:
         run_id = str(uuid.uuid4())
         summary = SyncSummary(
             run_id, self.options.program, str(self.program_root), dry_run=self.options.dry_run
@@ -127,6 +136,11 @@ class Synchronizer:
             changed = summary.new_reports + summary.updated_reports > 0 or bool(summary.errors)
             if changed or not (self.program_root / "index.json").exists():
                 self._write_indexes(records, now, summary)
+            first_program = relationship_data(matching[0], "program")
+            write_json(
+                self.program_root / "program.json",
+                {"schema_version": 1, "data": redact_data(first_program)},
+            )
             write_manifest(
                 self.program_root,
                 program=self.options.program,
@@ -136,11 +150,6 @@ class Synchronizer:
                 reports=records,
                 attachments=attachment_map,
                 failures=summary.errors,
-            )
-            first_program = relationship_data(matching[0], "program")
-            write_json(
-                self.program_root / "program.json",
-                {"schema_version": 1, "data": redact_data(first_program)},
             )
         return summary
 
@@ -175,7 +184,8 @@ class Synchronizer:
             report_dir = self.program_root / str(current["report_directory"])
             required = (
                 "report.md",
-                "report.json",
+                "report.raw.json",
+                "report.sanitized.json",
                 "original-report.md",
                 "timeline.json",
                 "metadata.json",
@@ -334,6 +344,7 @@ class Synchronizer:
                 continue
             if self.downloader is None:
                 self.downloader = AttachmentDownloader(max_bytes=max_bytes)
+                self._owns_downloader = True
             try:
                 result = self.downloader.download(url, target, size)
             except ExpiredAttachmentURLError as exc:
@@ -391,7 +402,7 @@ class Synchronizer:
         severity_counts: dict[str, int] = {}
         total_bounty = 0.0
         for record in records:
-            report_file = self.program_root / record["report_directory"] / "report.json"
+            report_file = self.program_root / record["report_directory"] / "report.raw.json"
             try:
                 report = json.loads(report_file.read_text(encoding="utf-8"))["data"]
             except (OSError, ValueError, KeyError, TypeError):

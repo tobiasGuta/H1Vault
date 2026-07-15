@@ -7,11 +7,13 @@ import ipaddress
 import os
 import secrets
 import socket
+import ssl
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+import httpcore
 import httpx
 
 from h1vault.exceptions import (
@@ -42,12 +44,17 @@ def validate_download_url(url: str, resolver: Resolver = resolve_addresses) -> N
     parsed = urlparse(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
         raise AttachmentDownloadError("Attachment URL must be credential-free HTTPS.")
+    _validated_addresses(parsed.hostname, resolver)
+
+
+def _validated_addresses(hostname: str, resolver: Resolver) -> list[str]:
     try:
-        addresses = list(resolver(parsed.hostname))
+        addresses = sorted(set(resolver(hostname)))
     except OSError as exc:
         raise AttachmentDownloadError("Attachment host could not be resolved safely.") from exc
     if not addresses:
         raise AttachmentDownloadError("Attachment host did not resolve to an address.")
+    validated: list[str] = []
     for raw in addresses:
         try:
             address = ipaddress.ip_address(raw.split("%", 1)[0])
@@ -59,6 +66,63 @@ def validate_download_url(url: str, resolver: Resolver = resolve_addresses) -> N
             raise AttachmentDownloadError(
                 "Attachment URL resolves to a non-public network address."
             )
+        validated.append(str(address))
+    return validated
+
+
+class PinnedNetworkBackend(httpcore.NetworkBackend):
+    """Resolve, validate, and connect to the same IP to prevent DNS rebinding."""
+
+    def __init__(self, resolver: Resolver, backend: httpcore.NetworkBackend | None = None) -> None:
+        self._resolver = resolver
+        self._backend = backend or httpcore.SyncBackend()
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.NetworkStream:
+        addresses = _validated_addresses(host, self._resolver)
+        last_error: Exception | None = None
+        for address in addresses:
+            try:
+                return self._backend.connect_tcp(
+                    address, port, timeout, local_address, socket_options
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise AttachmentDownloadError("Attachment host had no safe connectable address.")
+
+    def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.NetworkStream:
+        del path, timeout, socket_options
+        raise AttachmentDownloadError("Unix sockets are not valid attachment destinations.")
+
+    def sleep(self, seconds: float) -> None:
+        self._backend.sleep(seconds)
+
+
+class PinnedHTTPTransport(httpx.HTTPTransport):
+    """HTTPX transport using an address-pinning httpcore network backend."""
+
+    def __init__(self, resolver: Resolver) -> None:
+        super().__init__(verify=True, trust_env=False)
+        self._pool.close()
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=ssl.create_default_context(),
+            max_connections=3,
+            max_keepalive_connections=3,
+            network_backend=PinnedNetworkBackend(resolver),
+        )
 
 
 class AttachmentDownloader:
@@ -80,14 +144,18 @@ class AttachmentDownloader:
             limits=httpx.Limits(max_connections=3, max_keepalive_connections=3),
             follow_redirects=False,
             verify=True,
+            trust_env=False,
             headers={"User-Agent": "H1Vault attachment downloader"},
-            transport=transport,
+            transport=transport or PinnedHTTPTransport(resolver),
         )
 
     def __enter__(self) -> AttachmentDownloader:
         return self
 
     def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def close(self) -> None:
         self.client.close()
 
     def download(

@@ -51,7 +51,8 @@ def test_full_export_preserves_markdown_sorts_timeline_and_redacts(
     )
     markdown = (result.directory / "report.md").read_text(encoding="utf-8")
     original = (result.directory / "original-report.md").read_text(encoding="utf-8")
-    exported = json.loads((result.directory / "report.json").read_text(encoding="utf-8"))
+    raw = json.loads((result.directory / "report.raw.json").read_text(encoding="utf-8"))
+    exported = json.loads((result.directory / "report.sanitized.json").read_text(encoding="utf-8"))
     timeline = json.loads((result.directory / "timeline.json").read_text(encoding="utf-8"))
     assert "**original** markdown" in markdown
     assert original.startswith("**original** markdown")
@@ -61,8 +62,35 @@ def test_full_export_preserves_markdown_sorts_timeline_and_redacts(
         exported["data"]["relationships"]["attachments"]["data"][0]["attributes"]["expiring_url"]
         == REDACTED_URL
     )
+    assert (
+        raw["data"]["relationships"]["attachments"]["data"][0]["attributes"]["expiring_url"]
+        == REDACTED_URL
+    )
     assert timeline["activities"][0]["id"] == "1"
     assert "secret" not in result.directory.read_text() if result.directory.is_file() else True
+
+
+def test_raw_and_original_preserve_researcher_evidence_while_share_view_is_sanitized(
+    tmp_path: Path, report_factory
+) -> None:
+    evidence = "curl -H 'Authorization: Bearer example-vulnerable-token' /admin"
+    report = report_factory()
+    report["attributes"]["vulnerability_information"] = evidence
+    report["attributes"]["impact"] = "Signed example: https://target.test/?signature=poc-value"
+    result = export_report(
+        report,
+        tmp_path,
+        program="example-program",
+        synchronized_at="now",
+        attachment_records=[],
+    )
+    raw = json.loads((result.directory / "report.raw.json").read_text())["data"]
+    original = (result.directory / "original-report.md").read_text()
+    sanitized = json.loads((result.directory / "report.sanitized.json").read_text())["data"]
+    assert raw["attributes"]["vulnerability_information"] == evidence
+    assert evidence in original
+    assert "example-vulnerable-token" not in sanitized["attributes"]["vulnerability_information"]
+    assert "poc-value" not in sanitized["attributes"]["impact"]
 
 
 def test_minimal_report_optional_fields(tmp_path: Path) -> None:

@@ -43,6 +43,28 @@ def redact_data(value: Any) -> Any:
     return value
 
 
+def redact_temporary_capabilities(value: Any) -> Any:
+    """Copy API data while replacing only temporary download-capability fields.
+
+    This deliberately does not rewrite researcher-authored text. It is suitable for the
+    evidence-preserving raw export, where vulnerability information, impact, and activity
+    messages must remain byte-for-byte identical as JSON string values.
+    """
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = str(key).casefold().replace("-", "_")
+            result[str(key)] = (
+                REDACTED_URL
+                if normalized in TEMPORARY_KEYS
+                else redact_temporary_capabilities(item)
+            )
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [redact_temporary_capabilities(item) for item in value]
+    return value
+
+
 def redact_text(text: str, secrets: Sequence[str] = ()) -> str:
     result = AUTH_RE.sub(r"\1<redacted>", text)
     result = URL_SECRET_RE.sub(r"\1<redacted>", result)

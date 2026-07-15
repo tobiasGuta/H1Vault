@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import httpcore
 import httpx
 import pytest
 
@@ -11,7 +12,11 @@ from h1vault.exceptions import (
     AttachmentTooLargeError,
     ExpiredAttachmentURLError,
 )
-from h1vault.security.downloads import AttachmentDownloader, validate_download_url
+from h1vault.security.downloads import (
+    AttachmentDownloader,
+    PinnedNetworkBackend,
+    validate_download_url,
+)
 from h1vault.security.filenames import attachment_filename
 
 
@@ -100,6 +105,58 @@ def test_expired_url_has_distinct_error(tmp_path: Path) -> None:
     with downloader(lambda _: httpx.Response(403)) as instance:
         with pytest.raises(ExpiredAttachmentURLError):
             instance.download("https://files.example/a", tmp_path / "file")
+
+
+def test_attachment_client_does_not_trust_proxy_environment() -> None:
+    with downloader(lambda _: httpx.Response(200, content=b"ok")) as instance:
+        assert instance.client._trust_env is False
+
+
+def test_pinned_backend_rejects_dns_rebinding_before_connect() -> None:
+    calls = 0
+
+    def rebinding(_host: str) -> list[str]:
+        nonlocal calls
+        calls += 1
+        return ["93.184.216.34"] if calls == 1 else ["127.0.0.1"]
+
+    class RecordingBackend(httpcore.NetworkBackend):
+        def __init__(self) -> None:
+            self.hosts: list[str] = []
+
+        def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+            self.hosts.append(host)
+            raise AssertionError("unsafe address must never reach connect")
+
+        def connect_unix_socket(self, path, timeout=None, socket_options=None):
+            raise AssertionError("not used")
+
+    validate_download_url("https://rebind.example/a", rebinding)
+    recording = RecordingBackend()
+    backend = PinnedNetworkBackend(rebinding, recording)
+    with pytest.raises(AttachmentDownloadError, match="non-public"):
+        backend.connect_tcp("rebind.example", 443)
+    assert recording.hosts == []
+
+
+def test_pinned_backend_connects_to_validated_ip_not_hostname() -> None:
+    stream = httpcore.MockStream([])
+
+    class RecordingBackend(httpcore.NetworkBackend):
+        def __init__(self) -> None:
+            self.host: str | None = None
+
+        def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+            self.host = host
+            return stream
+
+        def connect_unix_socket(self, path, timeout=None, socket_options=None):
+            raise AssertionError("not used")
+
+    recording = RecordingBackend()
+    backend = PinnedNetworkBackend(lambda _: ["93.184.216.34"], recording)
+    assert backend.connect_tcp("attachment.example", 443) is stream
+    assert recording.host == "93.184.216.34"
 
 
 @pytest.mark.parametrize(
