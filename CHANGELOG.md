@@ -2,6 +2,14 @@
 
 All notable H1Vault changes are documented here.
 
+## 0.2.0 - 2026-07-15
+
+- Added SQLite schema 2 and evidence-preserving historical attachment reconciliation.
+- Kept valid archived attachments downloaded when later refreshes use `--skip-attachments`.
+- Prevented link-based pagination from falling back to numbered pages after `links.next` ends.
+- Preserved complete detailed-report JSON:API documents, including top-level additions.
+- Added verification and snapshot coverage for historical attachment versions.
+
 ## 0.1.0 — 2026-07-14
 
 - Initial open-source release.

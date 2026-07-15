@@ -80,19 +80,21 @@ class StateDatabase:
             columns = {
                 str(item[1]) for item in self.connection.execute("PRAGMA table_info(attachments)")
             }
-            additions = {
-                "source": "TEXT",
-                "activity_id": "TEXT",
-                "remote_file_name": "TEXT",
-                "content_type": "TEXT",
-                "present_in_latest_response": "INTEGER NOT NULL DEFAULT 1",
-                "historical_reason": "TEXT",
-            }
-            for name, declaration in additions.items():
-                if name not in columns:
-                    self.connection.execute(
-                        f"ALTER TABLE attachments ADD COLUMN {name} {declaration}"
-                    )
+            if "source" not in columns:
+                self.connection.execute("ALTER TABLE attachments ADD COLUMN source TEXT")
+            if "activity_id" not in columns:
+                self.connection.execute("ALTER TABLE attachments ADD COLUMN activity_id TEXT")
+            if "remote_file_name" not in columns:
+                self.connection.execute("ALTER TABLE attachments ADD COLUMN remote_file_name TEXT")
+            if "content_type" not in columns:
+                self.connection.execute("ALTER TABLE attachments ADD COLUMN content_type TEXT")
+            if "present_in_latest_response" not in columns:
+                self.connection.execute(
+                    "ALTER TABLE attachments ADD COLUMN present_in_latest_response "
+                    "INTEGER NOT NULL DEFAULT 1"
+                )
+            if "historical_reason" not in columns:
+                self.connection.execute("ALTER TABLE attachments ADD COLUMN historical_reason TEXT")
             self.connection.execute("UPDATE schema_version SET version = 2")
         self.connection.commit()
 
