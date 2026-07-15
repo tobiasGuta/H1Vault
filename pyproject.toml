@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "h1vault"
+version = "0.1.0"
+description = "Read-only local backups of a HackerOne researcher's own reports"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "H1Vault contributors" }]
+dependencies = [
+  "httpx>=0.27,<1",
+  "keyring>=25,<27",
+  "platformdirs>=4,<5",
+  "pydantic>=2.8,<3",
+  "rich>=13.8,<15",
+  "typer>=0.12,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.11,<2",
+  "pytest>=8.3,<10",
+  "pytest-cov>=5,<8",
+  "respx>=0.21,<1",
+  "ruff>=0.6,<1",
+]
+
+[project.scripts]
+h1vault = "h1vault.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/h1vault"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "SIM", "RUF"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S104", "S105", "S106", "S108", "SIM117"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["h1vault"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
