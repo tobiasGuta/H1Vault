@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -12,7 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from h1vault.api.client import HackerOneClient
-from h1vault.api.models import filter_program, program_handle, relationship_data
+from h1vault.api.models import (
+    DetailedReportResponse,
+    filter_program,
+    program_handle,
+    relationship_data,
+)
 from h1vault.backup.exporter import choose_report_directory, export_report
 from h1vault.backup.io import atomic_write, file_sha256, fingerprint, write_json
 from h1vault.backup.manifest import StateDatabase, write_manifest
@@ -29,7 +36,7 @@ from h1vault.exceptions import (
     ProgramNotFoundInReportsError,
 )
 from h1vault.security.downloads import AttachmentDownloader
-from h1vault.security.filenames import attachment_filename, safe_filename
+from h1vault.security.filenames import attachment_filename, ensure_within, safe_filename
 from h1vault.security.redaction import redact_data
 
 LOGGER = logging.getLogger(__name__)
@@ -193,8 +200,9 @@ class Synchronizer:
             missing = any(not (report_dir / name).is_file() for name in required)
             attachment_bad = any(
                 item.get("download_status") == "failed"
+                or item.get("source") is None
                 or (
-                    item.get("download_status") == "downloaded"
+                    item.get("download_status") in {"downloaded", "historical"}
                     and (
                         not item.get("local_path")
                         or not (self.program_root / str(item["local_path"])).is_file()
@@ -211,7 +219,8 @@ class Synchronizer:
         if not needs_detail:
             summary.unchanged_reports += 1
             return
-        detail = self.client.get_report(report_id)
+        response = self._fetch_detail(report_id)
+        detail = response.resource
         detail_handle = program_handle(detail)
         if (
             detail_handle is not None
@@ -223,13 +232,15 @@ class Synchronizer:
         attrs = attributes_of(detail)
         title = str(attrs.get("title") or "untitled")
         directory = choose_report_directory(self.reports_root, report_id, title)
-        attachment_records, refreshed_detail = self._process_attachments(
+        attachment_records, refreshed_response = self._process_attachments(
             detail, directory, report_id, state, summary
         )
-        detail = refreshed_detail or detail
+        final_response = refreshed_response or response
+        detail = final_response.resource
         result = export_report(
             detail,
             self.reports_root,
+            raw_document=final_response.raw_document,
             program=self.options.program,
             synchronized_at=now,
             attachment_records=attachment_records,
@@ -261,7 +272,19 @@ class Synchronizer:
                         "local_path": record.get("path"),
                         "sha256": record.get("sha256"),
                         "download_status": record["status"],
-                        "last_error": record.get("skip_reason") or record.get("error"),
+                        "last_error": (
+                            record.get("skip_reason")
+                            or record.get("error")
+                            or record.get("historical_reason")
+                        ),
+                        "source": record.get("source"),
+                        "activity_id": record.get("activity_id"),
+                        "remote_file_name": record.get("remote_file_name"),
+                        "content_type": record.get("content_type"),
+                        "present_in_latest_response": int(
+                            bool(record.get("present_in_latest_response", True))
+                        ),
+                        "historical_reason": record.get("historical_reason"),
                     }
                 )
         if current is None:
@@ -276,10 +299,16 @@ class Synchronizer:
         report_id: str,
         state: StateDatabase,
         summary: SyncSummary,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    ) -> tuple[list[dict[str, Any]], DetailedReportResponse | None]:
         records: list[dict[str, Any]] = []
-        refreshed: dict[str, Any] | None = None
+        refreshed: DetailedReportResponse | None = None
         attachments = extract_attachments(detail)
+        previous_items = {
+            str(item["attachment_key"]): item for item in state.attachments_for_report(report_id)
+        }
+        for stored in previous_items.values():
+            self._rebase_previous_path(stored, directory)
+        seen_keys: set[str] = set()
         self._progress("attachments_total", len(attachments))
         for item in attachments:
             attrs = attributes_of(item)
@@ -291,14 +320,14 @@ class Synchronizer:
                 if source == "activity"
                 else f"report:{attachment_id}"
             )
+            seen_keys.add(key)
             target_dir = (
                 directory / "attachments" / "activities" / safe_filename(activity_id)
                 if source == "activity"
                 else directory / "attachments" / "report"
             )
-            target = target_dir / attachment_filename(
-                attachment_id, str(attrs.get("file_name") or "unnamed")
-            )
+            remote_file_name = str(attrs.get("file_name") or "unnamed")
+            target = target_dir / attachment_filename(attachment_id, remote_file_name)
             relative = target.relative_to(self.program_root).as_posix()
             size = _optional_int(attrs.get("file_size"))
             base = {
@@ -306,6 +335,7 @@ class Synchronizer:
                 "id": attachment_id,
                 "source": source,
                 "activity_id": activity_id or None,
+                "remote_file_name": remote_file_name,
                 "path": relative,
                 "content_type": attrs.get("content_type"),
                 "size": size,
@@ -313,7 +343,24 @@ class Synchronizer:
                 "status": "pending",
                 "skip_reason": None,
                 "error": None,
+                "present_in_latest_response": True,
+                "historical_reason": None,
             }
+            previous = previous_items.get(key)
+            if previous and self._valid_existing(previous, size, relative, remote_file_name):
+                base.update(status="downloaded", sha256=previous["sha256"])
+                records.append(base)
+                self._progress("attachment_complete", 1)
+                continue
+            if previous and self._valid_archived(previous):
+                records.append(
+                    self._historical_record(
+                        previous,
+                        directory,
+                        reason="attachment metadata changed in latest API response",
+                        replacing_path=relative,
+                    )
+                )
             if not self.options.include_attachments:
                 base.update(status="skipped", skip_reason="attachments disabled by configuration")
                 summary.attachments_skipped += 1
@@ -326,12 +373,6 @@ class Synchronizer:
                     status="skipped", skip_reason=f"declared size exceeds {max_bytes} bytes"
                 )
                 summary.attachments_skipped += 1
-                records.append(base)
-                self._progress("attachment_complete", 1)
-                continue
-            previous = state.attachment(report_id, key)
-            if previous and self._valid_existing(previous, size):
-                base.update(status="downloaded", sha256=previous["sha256"])
                 records.append(base)
                 self._progress("attachment_complete", 1)
                 continue
@@ -348,8 +389,8 @@ class Synchronizer:
             try:
                 result = self.downloader.download(url, target, size)
             except ExpiredAttachmentURLError as exc:
-                refreshed = self.client.get_report(report_id)
-                refreshed_item = _find_attachment(refreshed, key)
+                refreshed = self._fetch_detail(report_id)
+                refreshed_item = _find_attachment(refreshed.resource, key)
                 refreshed_url = (
                     attributes_of(refreshed_item).get("expiring_url") if refreshed_item else None
                 )
@@ -380,21 +421,157 @@ class Synchronizer:
             summary.attachments_downloaded += 1
             records.append(base)
             self._progress("attachment_complete", 1)
+        record_keys = {str(item["key"]) for item in records}
+        for key, previous in previous_items.items():
+            if key in seen_keys or key in record_keys:
+                continue
+            if key.startswith("historical:"):
+                records.append(self._record_from_database(previous))
+            else:
+                records.append(
+                    self._historical_record(
+                        previous,
+                        directory,
+                        reason="not present in latest API response",
+                    )
+                )
         return records, refreshed
 
     def _progress(self, event: str, amount: int) -> None:
         if self.progress is not None:
             self.progress(event, amount)
 
-    def _valid_existing(self, previous: dict[str, Any], expected_size: int | None) -> bool:
-        if previous.get("download_status") != "downloaded" or not previous.get("local_path"):
-            return False
+    def _fetch_detail(self, report_id: str) -> DetailedReportResponse:
+        method = getattr(self.client, "get_report_response", None)
+        if callable(method):
+            response = method(report_id)
+            if isinstance(response, DetailedReportResponse):
+                return response
+        resource = self.client.get_report(report_id)
+        return DetailedReportResponse(raw_document={"data": resource}, resource=resource)
+
+    def _valid_existing(
+        self,
+        previous: dict[str, Any],
+        expected_size: int | None,
+        relative: str,
+        remote_file_name: str,
+    ) -> bool:
         if previous.get("expected_size") != expected_size:
+            return False
+        stored_name = previous.get("remote_file_name")
+        if stored_name is not None and stored_name != remote_file_name:
+            return False
+        if previous.get("download_status") not in {"downloaded", "historical"}:
+            return False
+        path = self.program_root / relative
+        return bool(
+            path.is_file()
+            and previous.get("sha256")
+            and file_sha256(path) == str(previous["sha256"])
+        )
+
+    def _valid_archived(self, previous: dict[str, Any]) -> bool:
+        if previous.get("download_status") not in {"downloaded", "historical"}:
+            return False
+        if not previous.get("local_path"):
             return False
         path = self.program_root / str(previous["local_path"])
         if not path.is_file() or not previous.get("sha256"):
             return False
         return file_sha256(path) == str(previous["sha256"])
+
+    def _rebase_previous_path(self, previous: dict[str, Any], directory: Path) -> None:
+        raw_path = previous.get("local_path")
+        if not isinstance(raw_path, str):
+            return
+        current = self.program_root / raw_path
+        parts = Path(raw_path).parts
+        if current.exists() or len(parts) < 3 or parts[0] != "reports":
+            return
+        candidate = directory.joinpath(*parts[2:])
+        if candidate.is_file():
+            previous["local_path"] = candidate.relative_to(self.program_root).as_posix()
+
+    def _historical_record(
+        self,
+        previous: dict[str, Any],
+        directory: Path,
+        *,
+        reason: str,
+        replacing_path: str | None = None,
+    ) -> dict[str, Any]:
+        key = str(previous["attachment_key"])
+        local_path = previous.get("local_path")
+        sha256 = previous.get("sha256")
+        if replacing_path is not None:
+            version_id = fingerprint(previous)[:16]
+            key = f"historical:{key}:{version_id}"
+            if local_path == replacing_path and self._valid_archived(previous):
+                source = self.program_root / str(local_path)
+                history_name = f"{version_id}_{Path(str(local_path)).name}"
+                history_target = (
+                    directory
+                    / "attachments"
+                    / "historical"
+                    / safe_filename(str(previous["attachment_id"]))
+                    / history_name
+                )
+                self._copy_archived_file(source, history_target)
+                if file_sha256(history_target) != str(sha256):
+                    raise OSError("Historical attachment relocation failed integrity validation.")
+                source.unlink()
+                local_path = history_target.relative_to(self.program_root).as_posix()
+        return {
+            "key": key,
+            "id": str(previous["attachment_id"]),
+            "source": previous.get("source") or _source_from_key(str(previous["attachment_key"])),
+            "activity_id": previous.get("activity_id"),
+            "remote_file_name": previous.get("remote_file_name"),
+            "content_type": previous.get("content_type"),
+            "path": local_path,
+            "size": previous.get("expected_size"),
+            "sha256": sha256,
+            "status": "historical",
+            "skip_reason": None,
+            "error": None,
+            "present_in_latest_response": False,
+            "historical_reason": reason,
+        }
+
+    def _record_from_database(self, previous: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "key": str(previous["attachment_key"]),
+            "id": str(previous["attachment_id"]),
+            "source": previous.get("source") or _source_from_key(str(previous["attachment_key"])),
+            "activity_id": previous.get("activity_id"),
+            "remote_file_name": previous.get("remote_file_name"),
+            "content_type": previous.get("content_type"),
+            "path": previous.get("local_path"),
+            "size": previous.get("expected_size"),
+            "sha256": previous.get("sha256"),
+            "status": str(previous["download_status"]),
+            "skip_reason": None,
+            "error": None,
+            "present_in_latest_response": bool(previous.get("present_in_latest_response", 0)),
+            "historical_reason": previous.get("historical_reason") or previous.get("last_error"),
+        }
+
+    def _copy_archived_file(self, source: Path, target: Path) -> None:
+        source = ensure_within(source, self.program_root)
+        target = ensure_within(target, self.program_root)
+        if target.is_file() and file_sha256(target) == file_sha256(source):
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.part")
+        try:
+            with source.open("rb") as reader, temporary.open("xb") as writer:
+                shutil.copyfileobj(reader, writer)
+                writer.flush()
+                os.fsync(writer.fileno())
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _write_indexes(self, records: list[dict[str, Any]], now: str, summary: SyncSummary) -> None:
         entries: list[dict[str, Any]] = []
@@ -501,3 +678,10 @@ def _find_attachment(report: dict[str, Any], key: str) -> dict[str, Any] | None:
         if candidate == key:
             return item
     return None
+
+
+def _source_from_key(key: str) -> str:
+    value = key
+    while value.startswith("historical:"):
+        value = value.removeprefix("historical:")
+    return "activity" if value.startswith("activity:") else "report"

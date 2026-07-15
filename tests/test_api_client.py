@@ -139,6 +139,20 @@ def test_unknown_fields_are_preserved(report_factory) -> None:
     assert detail["attributes"]["future_field"] == {"nested": True}
 
 
+def test_detailed_response_preserves_complete_top_level_document(report_factory) -> None:
+    report = report_factory()
+    document = {
+        "data": report,
+        "included": [{"id": "included-1", "type": "user"}],
+        "meta": {"future": True},
+        "links": {"self": "https://api.hackerone.com/v1/hackers/reports/123"},
+    }
+    with client(lambda _: httpx.Response(200, json=document)) as api:
+        response = api.get_report_response("123")
+    assert response.resource is response.raw_document["data"]
+    assert response.raw_document == document
+
+
 def test_tls_verification_cannot_be_disabled() -> None:
     with pytest.raises(TypeError):
         HackerOneClient(Credentials("u", "t", "test"), verify=False)  # type: ignore[call-arg]

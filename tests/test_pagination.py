@@ -84,6 +84,33 @@ def test_next_link_pagination_and_duplicate_ids() -> None:
         assert [item["id"] for item in api.iter_reports()] == ["1", "2"]
 
 
+def test_final_full_link_page_does_not_fall_back_to_numbered_page() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        if "cursor=second" in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [resource(i) for i in range(100, 200)],
+                    "links": {"next": None},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": [resource(i) for i in range(100)],
+                "links": {"next": "https://api.hackerone.com/v1/hackers/me/reports?cursor=second"},
+            },
+        )
+
+    with make_client(handler) as api:
+        assert len(list(api.iter_reports())) == 200
+    assert len(requests) == 2
+    assert "cursor=second" in requests[1]
+
+
 def test_repeated_next_link_is_rejected() -> None:
     next_url = "https://api.hackerone.com/v1/hackers/me/reports?page=2"
 

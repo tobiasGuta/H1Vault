@@ -323,7 +323,8 @@ def report_export(
             max_retries=runtime.settings.api.max_retries,
             concurrency=runtime.settings.api.concurrency,
         ) as client:
-            report = client.get_report(report_id)
+            response = client.get_report_response(report_id)
+            report = response.resource
             handle = program_handle(report) or "unknown-program"
             root = output / safe_filename(handle, fallback="program")
             directory = root / "reports"
@@ -331,6 +332,7 @@ def report_export(
             result = export_report(
                 report,
                 directory,
+                raw_document=response.raw_document,
                 program=handle,
                 synchronized_at=datetime.now(UTC).isoformat(),
                 attachment_records=attachments,

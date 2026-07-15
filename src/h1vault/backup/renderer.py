@@ -163,6 +163,13 @@ def render_report(
     if not attachment_records:
         lines.append("_No attachments recorded._")
     for record in attachment_records:
+        suffixes: list[str] = []
+        if record.get("skip_reason"):
+            suffixes.append(f"skipped: {record['skip_reason']}")
+        if record.get("historical_reason"):
+            suffixes.append(
+                f"historical; not present in latest API response: {record['historical_reason']}"
+            )
         lines.append(
             (
                 "- `{path}` — ID `{id}`, type `{content_type}`, size {size}, "
@@ -173,7 +180,7 @@ def render_report(
                 content_type=record.get("content_type") or "unknown",
                 size=record.get("size") if record.get("size") is not None else "unknown",
                 sha256=record.get("sha256") or "not available",
-                suffix=f" (skipped: {record['skip_reason']})" if record.get("skip_reason") else "",
+                suffix=f" ({'; '.join(suffixes)})" if suffixes else "",
             )
         )
     return "\n".join(lines).rstrip() + "\n"

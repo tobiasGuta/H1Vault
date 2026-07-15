@@ -10,7 +10,7 @@ from typing import Any
 
 from h1vault.backup.io import file_sha256, write_json
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class StateDatabase:
@@ -76,6 +76,24 @@ class StateDatabase:
                 UPDATE schema_version SET version = 1;
                 """
             )
+        if version < 2:
+            columns = {
+                str(item[1]) for item in self.connection.execute("PRAGMA table_info(attachments)")
+            }
+            additions = {
+                "source": "TEXT",
+                "activity_id": "TEXT",
+                "remote_file_name": "TEXT",
+                "content_type": "TEXT",
+                "present_in_latest_response": "INTEGER NOT NULL DEFAULT 1",
+                "historical_reason": "TEXT",
+            }
+            for name, declaration in additions.items():
+                if name not in columns:
+                    self.connection.execute(
+                        f"ALTER TABLE attachments ADD COLUMN {name} {declaration}"
+                    )
+            self.connection.execute("UPDATE schema_version SET version = 2")
         self.connection.commit()
 
     @contextmanager
@@ -131,15 +149,22 @@ class StateDatabase:
             """
             INSERT INTO attachments (
               report_id, attachment_key, attachment_id, expected_size, local_path,
-              sha256, download_status, last_error
+              sha256, download_status, last_error, source, activity_id, remote_file_name,
+              content_type, present_in_latest_response, historical_reason
             ) VALUES (
               :report_id, :attachment_key, :attachment_id, :expected_size, :local_path,
-              :sha256, :download_status, :last_error
+              :sha256, :download_status, :last_error, :source, :activity_id, :remote_file_name,
+              :content_type, :present_in_latest_response, :historical_reason
             )
             ON CONFLICT(report_id, attachment_key) DO UPDATE SET
               attachment_id=excluded.attachment_id, expected_size=excluded.expected_size,
               local_path=excluded.local_path, sha256=excluded.sha256,
-              download_status=excluded.download_status, last_error=excluded.last_error
+              download_status=excluded.download_status, last_error=excluded.last_error,
+              source=excluded.source, activity_id=excluded.activity_id,
+              remote_file_name=excluded.remote_file_name,
+              content_type=excluded.content_type,
+              present_in_latest_response=excluded.present_in_latest_response,
+              historical_reason=excluded.historical_reason
             """,
             record,
         )
@@ -179,7 +204,7 @@ def write_manifest(
 ) -> dict[str, Any]:
     report_items: list[dict[str, Any]] = []
     archive_files: dict[str, dict[str, Any]] = {}
-    downloaded = skipped = 0
+    downloaded = skipped = historical = 0
     for report in reports:
         report_id = str(report["report_id"])
         items = attachments.get(report_id, [])
@@ -202,18 +227,33 @@ def write_manifest(
             archive_files[f"{report_path}/{name}"] = record
         downloaded += sum(item.get("download_status") == "downloaded" for item in items)
         skipped += sum(item.get("download_status") == "skipped" for item in items)
+        historical += sum(item.get("download_status") == "historical" for item in items)
         attachment_records = []
         for item in items:
             attachment = {
+                "key": item["attachment_key"],
                 "id": item["attachment_id"],
+                "source": item.get("source"),
+                "activity_id": item.get("activity_id"),
+                "remote_file_name": item.get("remote_file_name"),
+                "content_type": item.get("content_type"),
                 "path": item.get("local_path"),
                 "sha256": item.get("sha256"),
                 "size": item.get("expected_size"),
                 "status": item["download_status"],
-                "error": item.get("last_error"),
+                "skip_reason": (
+                    item.get("last_error") if item["download_status"] == "skipped" else None
+                ),
+                "error": (item.get("last_error") if item["download_status"] == "failed" else None),
+                "present_in_latest_response": bool(item.get("present_in_latest_response", 1)),
+                "historical_reason": item.get("historical_reason"),
             }
             attachment_records.append(attachment)
-            if attachment["status"] == "downloaded" and attachment["path"] and attachment["sha256"]:
+            if (
+                attachment["status"] in {"downloaded", "historical"}
+                and attachment["path"]
+                and attachment["sha256"]
+            ):
                 archive_files[str(attachment["path"])] = {
                     "sha256": attachment["sha256"],
                     "size": attachment["size"],
@@ -248,6 +288,7 @@ def write_manifest(
         "statistics": {
             "attachments_downloaded": downloaded,
             "attachments_skipped": skipped,
+            "attachments_historical": historical,
             "errors": len(failures),
         },
     }

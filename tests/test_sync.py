@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import sqlite3
+import zipfile
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from h1vault.backup.manifest import StateDatabase
+from h1vault.backup.snapshot import create_snapshot
 from h1vault.backup.synchronizer import Synchronizer, SyncOptions
+from h1vault.backup.verifier import verify_backup
 from h1vault.exceptions import AttachmentDownloadError, ProgramNotFoundInReportsError
 from h1vault.security.downloads import DownloadResult
 
@@ -30,20 +36,21 @@ class FakeClient:
 
 
 class FakeDownloader:
-    def __init__(self, fail: bool = False) -> None:
+    def __init__(self, fail: bool = False, content: bytes = b"abc") -> None:
         self.calls = 0
         self.fail = fail
+        self.content = content
 
     def download(self, _url: str, destination: Path, _size: int | None) -> DownloadResult:
         self.calls += 1
         if self.fail:
             raise AttachmentDownloadError("interrupted")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(b"abc")
+        destination.write_bytes(self.content)
         return DownloadResult(
             destination,
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-            3,
+            hashlib.sha256(self.content).hexdigest(),
+            len(self.content),
             "text/plain",
         )
 
@@ -116,6 +123,19 @@ def test_attachment_download_and_second_run_skip(tmp_path: Path, report_factory)
     assert downloader.calls == 1
 
 
+def test_title_change_rebases_downloaded_attachment_without_redownload(
+    tmp_path: Path, report_factory
+) -> None:
+    report = report_factory(relationships=attachment_relationship())
+    client = FakeClient([report])
+    downloader = FakeDownloader()
+    Synchronizer(client, options(tmp_path), downloader=downloader).run()  # type: ignore[arg-type]
+    report["attributes"]["title"] = "Renamed report"
+    Synchronizer(client, options(tmp_path), downloader=downloader).run()  # type: ignore[arg-type]
+    assert downloader.calls == 1
+    assert verify_backup(tmp_path, "example-program").valid
+
+
 def test_synchronizer_closes_only_downloader_it_creates(
     tmp_path: Path, report_factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -173,6 +193,154 @@ def test_skip_attachments_records_metadata(tmp_path: Path, report_factory) -> No
     assert metadata["attachments"][0]["status"] == "skipped"
 
 
+def test_removed_remote_attachment_becomes_historical_and_snapshots(
+    tmp_path: Path, report_factory
+) -> None:
+    report = report_factory(relationships=attachment_relationship())
+    client = FakeClient([report])
+    downloader = FakeDownloader()
+    Synchronizer(client, options(tmp_path), downloader=downloader).run()  # type: ignore[arg-type]
+    report["relationships"]["attachments"]["data"] = []
+    Synchronizer(client, options(tmp_path, refresh=True), downloader=downloader).run()  # type: ignore[arg-type]
+
+    root = tmp_path / "example-program"
+    metadata = json.loads(next(root.glob("reports/*/metadata.json")).read_text())
+    attachment = metadata["attachments"][0]
+    assert attachment["status"] == "historical"
+    assert attachment["present_in_latest_response"] is False
+    assert "not present" in attachment["historical_reason"]
+    assert (root / attachment["path"]).read_bytes() == b"abc"
+    assert verify_backup(tmp_path, "example-program").valid
+
+    destination = tmp_path.parent / f"{tmp_path.name}-historical.zip"
+    snapshot, result = create_snapshot(tmp_path, "example-program", destination)
+    assert result.valid
+    with zipfile.ZipFile(snapshot) as archive:
+        assert any(name.endswith("a1_proof.txt") for name in archive.namelist())
+
+
+def test_direct_attachment_changed_to_activity_preserves_direct_history(
+    tmp_path: Path, report_factory
+) -> None:
+    report = report_factory(relationships=attachment_relationship())
+    client = FakeClient([report])
+    downloader = FakeDownloader()
+    Synchronizer(client, options(tmp_path), downloader=downloader).run()  # type: ignore[arg-type]
+    attachment = attachment_relationship()["attachments"]["data"][0]
+    report["relationships"]["attachments"]["data"] = []
+    report["relationships"]["activities"]["data"] = [
+        {
+            "id": "activity-1",
+            "type": "activity-comment",
+            "attributes": {"created_at": "2026-01-03T00:00:00Z"},
+            "relationships": {"attachments": {"data": [attachment]}},
+        }
+    ]
+    Synchronizer(client, options(tmp_path, refresh=True), downloader=downloader).run()  # type: ignore[arg-type]
+
+    root = tmp_path / "example-program"
+    metadata = json.loads(next(root.glob("reports/*/metadata.json")).read_text())
+    assert {(item["source"], item["status"]) for item in metadata["attachments"]} == {
+        ("report", "historical"),
+        ("activity", "downloaded"),
+    }
+    assert all((root / item["path"]).is_file() for item in metadata["attachments"])
+    assert verify_backup(tmp_path, "example-program").valid
+
+
+def test_skip_attachments_refresh_retains_valid_download(tmp_path: Path, report_factory) -> None:
+    report = report_factory(relationships=attachment_relationship())
+    client = FakeClient([report])
+    downloader = FakeDownloader()
+    Synchronizer(client, options(tmp_path), downloader=downloader).run()  # type: ignore[arg-type]
+    summary = Synchronizer(
+        client,
+        options(tmp_path, include_attachments=False, refresh=True),
+        downloader=downloader,
+    ).run()  # type: ignore[arg-type]
+
+    metadata = json.loads(
+        next((tmp_path / "example-program").glob("reports/*/metadata.json")).read_text()
+    )
+    assert downloader.calls == 1
+    assert summary.attachments_skipped == 0
+    assert metadata["attachments"][0]["status"] == "downloaded"
+    assert verify_backup(tmp_path, "example-program").valid
+
+
+def test_skip_after_remote_size_change_relocates_old_evidence(
+    tmp_path: Path, report_factory
+) -> None:
+    report = report_factory(relationships=attachment_relationship())
+    client = FakeClient([report])
+    Synchronizer(client, options(tmp_path), downloader=FakeDownloader()).run()  # type: ignore[arg-type]
+    report["relationships"]["attachments"]["data"][0]["attributes"]["file_size"] = 4
+    Synchronizer(
+        client,
+        options(tmp_path, include_attachments=False, refresh=True),
+        downloader=FakeDownloader(content=b"unused"),
+    ).run()  # type: ignore[arg-type]
+
+    root = tmp_path / "example-program"
+    metadata = json.loads(next(root.glob("reports/*/metadata.json")).read_text())
+    by_status = {item["status"]: item for item in metadata["attachments"]}
+    assert set(by_status) == {"historical", "skipped"}
+    assert (root / by_status["historical"]["path"]).read_bytes() == b"abc"
+    assert not (root / by_status["skipped"]["path"]).exists()
+    assert verify_backup(tmp_path, "example-program").valid
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value", "content"),
+    [("file_name", "renamed.txt", b"xyz"), ("file_size", 4, b"abcd")],
+)
+def test_attachment_filename_or_size_change_preserves_previous_evidence(
+    tmp_path: Path,
+    report_factory,
+    changed_field: str,
+    changed_value: str | int,
+    content: bytes,
+) -> None:
+    report = report_factory(relationships=attachment_relationship())
+    client = FakeClient([report])
+    Synchronizer(client, options(tmp_path), downloader=FakeDownloader()).run()  # type: ignore[arg-type]
+    report["relationships"]["attachments"]["data"][0]["attributes"][changed_field] = changed_value
+    Synchronizer(
+        client,
+        options(tmp_path, refresh=True),
+        downloader=FakeDownloader(content=content),
+    ).run()  # type: ignore[arg-type]
+
+    root = tmp_path / "example-program"
+    metadata = json.loads(next(root.glob("reports/*/metadata.json")).read_text())
+    by_status = {item["status"]: item for item in metadata["attachments"]}
+    assert set(by_status) == {"historical", "downloaded"}
+    assert (root / by_status["historical"]["path"]).read_bytes() == b"abc"
+    assert (root / by_status["downloaded"]["path"]).read_bytes() == content
+    assert verify_backup(tmp_path, "example-program").valid
+
+
+def test_repeated_filename_changes_with_same_bytes_keep_every_version(
+    tmp_path: Path, report_factory
+) -> None:
+    report = report_factory(relationships=attachment_relationship())
+    client = FakeClient([report])
+    for index, name in enumerate(("proof.txt", "second.txt", "third.txt")):
+        report["relationships"]["attachments"]["data"][0]["attributes"]["file_name"] = name
+        Synchronizer(
+            client,
+            options(tmp_path, refresh=index > 0),
+            downloader=FakeDownloader(),
+        ).run()  # type: ignore[arg-type]
+
+    root = tmp_path / "example-program"
+    metadata = json.loads(next(root.glob("reports/*/metadata.json")).read_text())
+    assert [item["status"] for item in metadata["attachments"]].count("historical") == 2
+    assert len({item["key"] for item in metadata["attachments"]}) == 3
+    assert all((root / item["path"]).is_file() for item in metadata["attachments"])
+    assert verify_backup(tmp_path, "example-program").valid
+
+
 def test_one_report_failure_continues_by_default(tmp_path: Path, report_factory) -> None:
     client = FakeClient([report_factory("1"), report_factory("2")])
     client.fail_ids.add("1")
@@ -216,3 +384,37 @@ def test_database_update_follows_successful_export(
         tmp_path / "example-program" / "state.sqlite3", initialize=False
     ) as database:
         assert database.report("123") is None
+
+
+def test_schema_one_database_migrates_attachment_provenance_columns(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version VALUES (1);
+            CREATE TABLE attachments (
+                report_id TEXT NOT NULL,
+                attachment_key TEXT NOT NULL,
+                attachment_id TEXT NOT NULL,
+                expected_size INTEGER,
+                local_path TEXT,
+                sha256 TEXT,
+                download_status TEXT NOT NULL,
+                last_error TEXT,
+                PRIMARY KEY(report_id, attachment_key)
+            );
+            """
+        )
+    with StateDatabase(path) as database:
+        version = database.connection.execute("SELECT version FROM schema_version").fetchone()[0]
+        columns = {row[1] for row in database.connection.execute("PRAGMA table_info(attachments)")}
+    assert version == 2
+    assert {
+        "source",
+        "activity_id",
+        "remote_file_name",
+        "content_type",
+        "present_in_latest_response",
+        "historical_reason",
+    } <= columns

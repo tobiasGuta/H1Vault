@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -27,6 +28,14 @@ class ResourceCollection(BaseModel):
 class ResourceDocument(BaseModel):
     model_config = ConfigDict(extra="allow")
     data: Resource
+
+
+@dataclass(frozen=True)
+class DetailedReportResponse:
+    """Validated complete JSON:API document plus its report resource."""
+
+    raw_document: dict[str, Any]
+    resource: dict[str, Any]
 
 
 def relationship_data(resource: dict[str, Any], name: str) -> Any:

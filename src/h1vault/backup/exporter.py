@@ -46,6 +46,7 @@ def export_report(
     report: dict[str, Any],
     reports_root: Path,
     *,
+    raw_document: dict[str, Any] | None = None,
     program: str,
     synchronized_at: str,
     attachment_records: list[dict[str, Any]],
@@ -58,7 +59,7 @@ def export_report(
     title = str(attributes.get("title") or "untitled")
     directory = choose_report_directory(reports_root, report_id, title)
     directory.mkdir(parents=True, exist_ok=True)
-    raw_report = redact_temporary_capabilities(report)
+    raw_report = redact_temporary_capabilities(raw_document or {"data": report})
     safe_report = redact_data(report)
     timeline = redact_data(extract_activities(report))
     report_hash = fingerprint(raw_report)
@@ -70,7 +71,7 @@ def export_report(
         "timeline.json",
         "metadata.json",
     )
-    write_json(directory / "report.raw.json", {"data": raw_report})
+    write_json(directory / "report.raw.json", raw_report)
     write_json(directory / "report.sanitized.json", {"data": safe_report})
     write_json(directory / "timeline.json", {"schema_version": 1, "activities": timeline})
     atomic_write(

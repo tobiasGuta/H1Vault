@@ -103,6 +103,12 @@ failed, missing, or explicitly refreshed reports. Attachment IDs, sizes, paths, 
 tracked in SQLite. A second unchanged run avoids rewriting report exports and avoids attachment
 downloads. Existing attachments are SHA-256 checked before reuse.
 
+When a later API response no longer contains an archived attachment, H1Vault preserves its local
+bytes and SHA-256, marks the record `historical`, and labels it as absent from the latest response in
+both `metadata.json` and the manifest. Filename, size, or source-location changes preserve the prior
+version before archiving the current one. `--skip-attachments` prevents new downloads; it does not
+invalidate an already downloaded attachment that still passes its integrity and metadata checks.
+
 ```powershell
 h1vault sync --program "example-program" --output "D:\HackerOneBackups" --dry-run
 h1vault sync --program "example-program" --output "D:\HackerOneBackups" --refresh
@@ -150,15 +156,17 @@ The report ID is the stable directory identity; the title suffix is cosmetic. Re
 made Windows-safe, length-limited, collision-resistant through attachment IDs, and contained beneath
 the expected attachment directory.
 
-`report.raw.json` preserves the accessible API report as evidence, replacing only API-generated
-temporary attachment capabilities. `original-report.md` preserves the researcher's vulnerability
+`report.raw.json` preserves the complete accessible JSON:API response document, including top-level
+`included`, `meta`, and `links` additions, replacing only API-generated temporary attachment
+capabilities. `original-report.md` preserves the researcher's vulnerability
 information and separate impact text without sanitizing PoC headers or signed-example parameters.
 These two files are confidential and are not safe-to-share views. `report.sanitized.json`,
 `timeline.json`, and the clearly labeled `report.md` apply defensive redaction for presentation.
 
 Backups created by H1Vault before manifest schema 2 must be synchronized once before `verify` or
 `snapshot`. The next sync detects the missing split exports, regenerates them, removes legacy
-`report.json`, and atomically writes the schema-2 manifest; the SQLite schema itself is unchanged.
+`report.json`, atomically writes the schema-2 manifest, and migrates SQLite attachment state to
+schema 2 so historical provenance can be retained.
 
 ## Verification
 

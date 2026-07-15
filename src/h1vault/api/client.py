@@ -14,7 +14,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from h1vault import __version__
-from h1vault.api.models import ResourceCollection, ResourceDocument
+from h1vault.api.models import DetailedReportResponse, ResourceCollection, ResourceDocument
 from h1vault.credentials import Credentials
 from h1vault.exceptions import (
     APIResponseError,
@@ -163,7 +163,7 @@ class HackerOneClient:
                 next_url = next_link
                 use_links = True
                 page += 1
-            elif not items or len(items) < page_size:
+            elif use_links or not items or len(items) < page_size:
                 next_url = None
             else:
                 page += 1
@@ -171,12 +171,19 @@ class HackerOneClient:
                 use_links = False
 
     def get_report(self, report_id: str) -> dict[str, Any]:
+        return self.get_report_response(report_id).resource
+
+    def get_report_response(self, report_id: str) -> DetailedReportResponse:
+        """Return the validated full response without discarding top-level additions."""
         raw = self.get_json(f"hackers/reports/{report_id}")
         try:
-            document = ResourceDocument.model_validate(raw)
+            ResourceDocument.model_validate(raw)
         except Exception as exc:
             raise InvalidAPIResponseError("Malformed detailed-report response.") from exc
-        return document.data.model_dump(mode="json", exclude_none=False)
+        resource = raw.get("data")
+        if not isinstance(resource, dict):
+            raise InvalidAPIResponseError("Malformed detailed-report response.")
+        return DetailedReportResponse(raw_document=raw, resource=resource)
 
     def doctor_request(self) -> None:
         self.get_json("hackers/me/reports", params={"page[number]": 1, "page[size]": 1})

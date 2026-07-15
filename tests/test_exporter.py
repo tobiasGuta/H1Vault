@@ -102,6 +102,27 @@ def test_minimal_report_optional_fields(tmp_path: Path) -> None:
     assert json.loads((result.directory / "timeline.json").read_text())["activities"] == []
 
 
+def test_raw_export_preserves_complete_document_top_level_fields(
+    tmp_path: Path, report_factory
+) -> None:
+    report = report_factory()
+    document = {
+        "data": report,
+        "included": [{"id": "u1", "type": "user", "attributes": {"name": "Researcher"}}],
+        "meta": {"revision": 7},
+        "links": {"self": "https://api.hackerone.com/v1/hackers/reports/123"},
+    }
+    result = export_report(
+        report,
+        tmp_path,
+        raw_document=document,
+        program="example-program",
+        synchronized_at="now",
+        attachment_records=[],
+    )
+    assert json.loads((result.directory / "report.raw.json").read_text()) == document
+
+
 def test_title_change_renames_without_losing_files(tmp_path: Path, report_factory) -> None:
     first = export_report(
         report_factory(title="Old title"),

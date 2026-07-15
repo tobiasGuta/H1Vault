@@ -167,7 +167,8 @@ def _verify_report(
                 parsed[name] = json.loads((report_dir / name).read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
                 result.add_error(f"Report {report_id} has invalid {name}: {exc}")
-    raw_data = _document_data(parsed.get("report.raw.json"))
+    raw_document = parsed.get("report.raw.json")
+    raw_data = _document_data(raw_document)
     sanitized_data = _document_data(parsed.get("report.sanitized.json"))
     metadata = parsed.get("metadata.json")
     if raw_data is None:
@@ -178,9 +179,9 @@ def _verify_report(
         raw_program = program_handle(raw_data)
         if raw_program is None or normalize_handle(raw_program) != normalize_handle(program):
             result.add_error(f"Report {report_id} raw JSON contains a different program handle.")
-        if fingerprint(raw_data) != report.get("detail_sha256"):
+        if fingerprint(raw_document) != report.get("detail_sha256"):
             result.add_error(f"Report {report_id} detailed-response fingerprint mismatch.")
-        _inspect_value(raw_data, f"report {report_id}/report.raw.json", result, secrets=False)
+        _inspect_value(raw_document, f"report {report_id}/report.raw.json", result, secrets=False)
     if sanitized_data is None:
         result.add_error(f"Report {report_id} sanitized JSON document is malformed.")
     else:
@@ -218,7 +219,12 @@ def _verify_attachments(
     if manifest_normalized != metadata_normalized:
         result.add_error(f"Report {report_id} manifest and metadata attachment records disagree.")
     for attachment in manifest_items:
-        if not isinstance(attachment, dict) or attachment.get("status") != "downloaded":
+        if not isinstance(attachment, dict) or attachment.get("status") not in {
+            "downloaded",
+            "historical",
+        }:
+            continue
+        if attachment.get("status") == "historical" and not attachment.get("sha256"):
             continue
         relative = attachment.get("path")
         if not isinstance(relative, str) or not relative:
@@ -230,15 +236,22 @@ def _verify_attachments(
         result.checked_attachments += 1
 
 
-def _attachment_tuple(item: dict[str, Any]) -> tuple[str, str, str, str, str, str]:
+def _attachment_tuple(item: dict[str, Any]) -> tuple[str, ...]:
     error = item.get("error") or item.get("skip_reason")
     return (
+        str(item.get("key")),
         str(item.get("id")),
+        str(item.get("source")),
+        str(item.get("activity_id")),
+        str(item.get("remote_file_name")),
+        str(item.get("content_type")),
         str(item.get("path")),
         str(item.get("sha256")),
         str(item.get("size")),
         str(item.get("status")),
         str(error),
+        str(item.get("present_in_latest_response")),
+        str(item.get("historical_reason")),
     )
 
 
